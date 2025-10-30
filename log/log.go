@@ -48,8 +48,10 @@ const (
 	LOG_LEVEL_ALL   = LOG_LEVEL_DEBUG
 )
 
-const FORMAT_TIME_DAY string = "20060102"
-const FORMAT_TIME_HOUR string = "2006010215"
+const (
+	FORMAT_TIME_DAY  string = "20060102"
+	FORMAT_TIME_HOUR string = "2006010215"
+)
 
 var _log *Logger = New()
 
@@ -65,6 +67,7 @@ func GlobalLogger() *log.Logger {
 func SetLevel(level LogLevel) {
 	_log.SetLevel(level)
 }
+
 func GetLogLevel() LogLevel {
 	return _log.level
 }
@@ -281,27 +284,26 @@ func NewLogger(w io.Writer, prefix string) *Logger {
 	return &Logger{_log: log.New(w, prefix, LstdFlags), level: level, highlighting: true}
 }
 
-const debug = 0
-const debug_raft = 0
-const debug_raftStore = 0
+const (
+	debug           = 0
+	debug_raft      = 0
+	debug_raftStore = 0
+)
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
+func DPrintf(format string, a ...interface{}) {
 	if debug > 0 {
 		_log.Infof(format, a...)
 	}
-	return
 }
 
-func DPrintfRaft(format string, a ...interface{}) (n int, err error) {
+func DPrintfRaft(format string, a ...interface{}) {
 	if debug_raft > 0 {
 		log.Printf("[Raft]: "+format, a...)
 	}
-	return
 }
 
-func DPrintfRaftStore(format string, a ...interface{}) (n int, err error) {
+func DPrintfRaftStore(format string, a ...interface{}) {
 	if debug_raftStore > 0 {
 		log.Printf("[RaftStore]: "+format, a...)
 	}
-	return
 }

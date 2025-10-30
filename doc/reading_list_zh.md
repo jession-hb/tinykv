@@ -1,0 +1,120 @@
+- 存储引擎
+  - 磁盘 I/O
+    - I/O 类型
+      - <https://medium.com/databasss/on-disk-io-part-1-flavours-of-io-8e1ace1de017>
+      - <https://medium.com/databasss/on-disk-io-part-2-more-flavours-of-io-c945db3edb13?>
+    - 放大效应与 RUM
+      - <http://smalldatum.blogspot.com/2015/11/read-write-space-amplification-pick-2_23.html>
+      - <http://daslab.seas.harvard.edu/rum-conjecture/>
+      - <http://smalldatum.blogspot.com/2019/05/crum-conjecture-read-write-space-and.html>
+  - B-Tree（可选）
+    - 推荐阅读
+      - Database Internals: 2. B-Tree 基础
+      - Database Internals: 3. 文件格式
+      - Database Internals: 4. B-Tree 实现
+    - 参考
+      - <https://www.cs.usfca.edu/~galles/visualization/Algorithms.html>
+      - <https://github.com/etcd-io/bbolt>
+  - LSM-Tree
+    - 推荐阅读
+      - Database Internals: 7. 日志结构存储
+    - 参考
+      - <https://github.com/google/leveldb>
+      - <https://github.com/facebook/rocksdb>
+      - <https://github.com/syndtr/goleveldb>
+    - B-Tree vs LSM-tree
+      - <https://tikv.org/docs/deep-dive/key-value-engine/b-tree-vs-lsm/>
+  - LSM-Tree 演进
+    - Wisckey
+      - <https://www.usenix.org/system/files/conference/fast16/fast16-papers-lu.pdf>
+    - HashKV（可选）
+      - <https://www.usenix.org/system/files/conference/atc18/atc18-chan.pdf>
+    - Monkey（可选）
+      - <https://stratos.seas.harvard.edu/files/stratos/files/monkeykeyvaluestore.pdf>
+    - 参考
+      - <https://github.com/dgraph-io/badger>
+      - <https://github.com/tikv/titan>
+- 序列化与 RPC
+  - Protocol Buffer
+    - 推荐阅读
+      - <https://developers.google.com/protocol-buffers/docs/overview>
+    - 参考
+      - <https://github.com/dgraph-io/badger>
+      - <https://github.com/protocolbuffers/protobuf>
+  - gRPC
+    - 推荐阅读
+      - <https://www.grpc.io/docs/quickstart/go/>
+    - 参考
+      - <https://github.com/grpc/grpc-go>
+- 数据分区
+  - Range vs Hash
+    - <https://tikv.org/docs/deep-dive/scalability/data-sharding/>
+  - DynamoDB 分区（可选）
+    - <https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf>
+    - <https://dzone.com/articles/partitioning-behavior-of-dynamodb>
+  - TiKV 分区
+    - <https://pingcap.com/blog/2017-07-11-tidbinternal1/>
+- 复制与一致性
+  - 推荐阅读
+    - Database Internals: 11. 复制与一致性
+  - CAP vs PACELE
+    - <http://www.cs.umd.edu/~abadi/papers/abadi-pacelc.pdf>
+  - 时钟与时间
+    - <https://dzone.com/articles/tick-or-tock-keeping-time-and-order-in-distributed-1>
+  - 一致性
+    - <https://arxiv.org/pdf/1902.03305.pdf>
+- 共识
+  - Quorum
+    - <https://en.wikipedia.org/wiki/Quorum_(distributed_computing)>
+  - Paxos（可选）
+    - 推荐阅读
+      - Database Internals: 14. 共识 @ Paxos
+    - 参考
+      - <https://lamport.azurewebsites.net/pubs/paxos-simple.pdf>
+  - Raft
+    - 推荐阅读
+      - Database Internals: 14. 共识 @ Raft
+    - 参考
+      - <https://raft.github.io/>
+      - <https://pdos.csail.mit.edu/6.824/labs/lab-raft.html>
+- 扩展与均衡
+  - Multi-Raft
+    - <https://tikv.org/deep-dive/scalability/multi-raft/>
+  - 分裂与合并
+    - <https://pingcap.com/blog/tidb-internal-scheduling/>
+  - 均衡
+    - <https://pingcap.com/blog/tidb-internal-scheduling/>
+- 分布式事务
+  - 推荐阅读
+    - Database Internals: 5. 事务处理与恢复
+    - Database Internals: 13. 分布式事务
+  - ACID
+    - <https://en.wikipedia.org/wiki/ACID>
+  - 隔离性（可选）
+    - <https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-95-51.pdf>
+    - <https://www.jianshu.com/p/3673e612cce2>（中文）
+  - Spanner（可选）
+    - <https://storage.googleapis.com/pub-tools-public-publication-data/pdf/45855.pdf>
+    - <https://www.jianshu.com/p/f307bd2023f5>（中文）
+  - Percolator
+    - <https://tikv.org/docs/deep-dive/distributed-transaction/percolator/>
+    - <https://tikv.org/docs/deep-dive/distributed-transaction/optimized-percolator/>
+- Coprocessor（可选）
+  - <https://blogs.apache.org/hbase/entry/coprocessor_introduction>
+  - <https://zhuanlan.zhihu.com/p/89518391>（中文）
+- 基准测试与测试
+  - sysbench（可选）
+    - <https://github.com/akopytov/sysbench>
+    - <https://www.percona.com/blog/2019/04/25/creating-custom-sysbench-scripts/>
+    - <https://www.jianshu.com/p/30933e0bebe7>（中文）
+  - go-tpc（可选）
+    - <https://github.com/pingcap/go-tpc>
+  - go-ycsb
+    - <https://github.com/pingcap/go-ycsb>
+    - <https://medium.com/@siddontang/use-go-ycsb-to-benchmarkdifferent-databases-8850f6edb3a7>
+    - <https://www.jianshu.com/p/73d22befe47d>（中文）
+  - Chaos
+    - <https://principlesofchaos.org/>
+    - <https://pingcap.com/blog/chaos-practice-in-tidb/>
+    - <https://medium.com/@siddontang/use-chaos-to-test-the-distributed-system-linearizability-4e0e778dfc7d>
+

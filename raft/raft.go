@@ -249,7 +249,7 @@ func (r *Raft) sendAppend(to uint64) {
 		Index:   prevLogIndex,
 		LogTerm: prevLogTerm,
 		Entries: entries,
-		Commit:  min(r.RaftLog.committed, r.Prs[to].Match),
+		Commit:  r.RaftLog.committed,
 	}
 	r.msgs = append(r.msgs, msg)
 	log.DPrintfRaft("%x send append to %x, prevLogIndex:%d, prevLogTerm:%d, entries:%v, commit:%d\n", r.id, to, prevLogIndex, prevLogTerm, entries, msg.Commit)
@@ -739,7 +739,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 	// 更新提交日志索引
 	if m.Commit > r.RaftLog.committed {
-		r.RaftLog.committed = min(m.Commit, r.RaftLog.LastIndex())
+		// 这一块不能直接使用r.RaftLog.LastIndex()，因为可能Leader使用了一个空日志来同步提交索引
+		// 这样Follower的旧日志不会被删除（因为空日志不会进入上面的for循环），但是提交索引是可以更新的
+		// 相当于Leader告诉Follower“我的日志到这里是对的，你可以提交到这里了”
+		// 所以需要取m.Index + len(m.Entries)作为上限
+		r.RaftLog.committed = min(m.Commit, m.Index+uint64(len(m.Entries)))
 	}
 }
 
@@ -843,4 +847,14 @@ func (r *Raft) updateCommitIndex() {
 		}
 	}
 	r.RaftLog.committedTo(N)
+}
+
+func (r *Raft) softState() *SoftState { return &SoftState{Lead: r.Lead, RaftState: r.State} }
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
 }

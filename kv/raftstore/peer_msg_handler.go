@@ -43,6 +43,23 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
+	if d.RaftGroup.HasReady() {
+		rd := d.RaftGroup.Ready()
+		// 需要将Ready中的相关元数据和hardstate持久化到存储引擎中
+		_, err := d.peerStorage.SaveReadyState(&rd)
+		if err != nil {
+			return
+		}
+
+		// trans是抽象出来的raft之间的消息传输层，其只定义一个Send方法
+		// 具体如何传递过去（RPC还是本地队列等方法），由上层调用者实现
+		if rd.Messages != nil {
+			d.Send(d.ctx.trans, rd.Messages)
+		}
+
+		// 更新kvdb中的apply_state与region_state
+
+	}
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -53,6 +70,7 @@ func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 			log.Errorf("%s handle raft message error %v", d.Tag, err)
 		}
 	case message.MsgTypeRaftCmd:
+		// 由客户端发送的信息，如读写请求或者管理命令，需要使用回调函数回复信息
 		raftCMD := msg.Data.(*message.MsgRaftCmd)
 		d.proposeRaftCommand(raftCMD.Request, raftCMD.Callback)
 	case message.MsgTypeTick:
@@ -114,6 +132,41 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	if len(msg.Requests) > 0 {
+		for _, req := range msg.Requests {
+			var key []byte
+			switch req.CmdType {
+			case raft_cmdpb.CmdType_Get:
+				key = req.Get.GetKey()
+			case raft_cmdpb.CmdType_Put:
+				key = req.Put.GetKey()
+			case raft_cmdpb.CmdType_Delete:
+				key = req.Delete.GetKey()
+			}
+			// 检查请求的 key 是否在当前 region 范围内
+			err = util.CheckKeyInRegion(key, d.Region())
+			if err != nil && req.CmdType != raft_cmdpb.CmdType_Snap {
+				cb.Done(ErrResp(err))
+				return
+			}
+			singleReq := &raft_cmdpb.RaftCmdRequest{
+				Header:   msg.Header,
+				Requests: []*raft_cmdpb.Request{req},
+			}
+			data, marshalErr := singleReq.Marshal()
+			if marshalErr != nil {
+				log.Panic(marshalErr)
+			}
+			// 记录下一个 proposal 的 index 和 term，用于之后的回调函数处理
+			p := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
+			d.proposals = append(d.proposals, p)
+			err := d.RaftGroup.Propose(data)
+			if err != nil {
+				cb.Done(ErrResp(err))
+				return
+			}
+		}
+	}
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -223,9 +276,9 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)
@@ -271,7 +324,8 @@ func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 }
 
 func handleStaleMsg(trans Transport, msg *rspb.RaftMessage, curEpoch *metapb.RegionEpoch,
-	needGC bool) {
+	needGC bool,
+) {
 	regionID := msg.RegionId
 	fromPeer := msg.FromPeer
 	toPeer := msg.ToPeer

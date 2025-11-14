@@ -2,14 +2,18 @@ package raftstore
 
 import (
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
@@ -43,6 +47,247 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
+	rawNode := d.RaftGroup
+	if !rawNode.HasReady() {
+		return
+	}
+	ready := rawNode.Ready()
+
+	// 持久化
+	applySnapRet, err := d.peerStorage.SaveReadyState(&ready)
+	if err != nil {
+		return
+	}
+	// 快照影响 region
+	if applySnapRet != nil {
+		if !reflect.DeepEqual(applySnapRet.PrevRegion, applySnapRet.Region) {
+			d.peerStorage.SetRegion(applySnapRet.Region)
+			d.ctx.storeMeta.Lock()
+			d.ctx.storeMeta.regions[applySnapRet.Region.Id] = applySnapRet.Region
+			d.ctx.storeMeta.regionRanges.Delete(&regionItem{region: applySnapRet.PrevRegion})
+			d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: applySnapRet.Region})
+			d.ctx.storeMeta.Unlock()
+		}
+	}
+
+	// 发 msg
+	if len(ready.Messages) != 0 {
+		d.Send(d.ctx.trans, ready.Messages)
+	}
+
+	// apply 应该写入 kvDB 中
+	for _, entry := range ready.CommittedEntries {
+		d.peerStorage.applyState.AppliedIndex = entry.Index
+
+		kvWB := new(engine_util.WriteBatch)
+		// 执行条目
+		if entry.EntryType == eraftpb.EntryType_EntryConfChange {
+		} else {
+			d.execEntry(&entry, kvWB)
+		}
+		// 停了就直接退出
+		if d.stopped {
+			return
+		}
+		// 写入状态
+		err = kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+		if err != nil {
+			log.Panic(err)
+		}
+		err = kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+
+		engines := d.peerStorage.Engines
+		txn := engines.Kv.NewTransaction(false)
+		regionId := d.peerStorage.Region().GetId()
+		regionState := new(rspb.RegionLocalState)
+		err = engine_util.GetMetaFromTxn(txn, meta.RegionStateKey(regionId), regionState)
+		if err != nil {
+			log.Panic(err)
+		}
+	}
+
+	// 推进
+	d.RaftGroup.Advance(ready)
+}
+
+func (p *peerMsgHandler) execEntry(entry *eraftpb.Entry, WB *engine_util.WriteBatch) {
+	// 判断是否是entryType是否是normal
+	if entry.EntryType != eraftpb.EntryType_EntryNormal {
+		return
+	}
+	// 反序列化entry信息
+	msg := &raft_cmdpb.RaftCmdRequest{}
+	err := msg.Unmarshal(entry.Data)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	// 判断是否当前节点的regionepoch更新
+	if msg.Header != nil {
+		fromEpoch := msg.GetHeader().GetRegionEpoch()
+		if fromEpoch != nil && util.IsEpochStale(fromEpoch, p.Region().GetRegionEpoch()) {
+			resp := ErrResp(&util.ErrEpochNotMatch{})
+			p.processProposals(resp, entry, false)
+			return
+		}
+	}
+
+	// admin命令
+	if msg.AdminRequest != nil {
+		req := msg.GetAdminRequest()
+		switch req.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			p.execCompactLog(entry, req, WB)
+		case raft_cmdpb.AdminCmdType_Split:
+		}
+	}
+
+	// common requests
+	if len(msg.Requests) > 0 {
+		req := msg.GetRequests()[0]
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			p.execGet(entry, req)
+		case raft_cmdpb.CmdType_Put:
+			p.execPut(entry, req, WB)
+		case raft_cmdpb.CmdType_Delete:
+			p.execDelete(entry, req, WB)
+		case raft_cmdpb.CmdType_Snap:
+			p.execSnap(entry)
+		}
+	}
+}
+
+func (d *peerMsgHandler) execGet(entry *eraftpb.Entry, req *raft_cmdpb.Request) {
+	value, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+
+	resps := []*raft_cmdpb.Response{{
+		CmdType: raft_cmdpb.CmdType_Get,
+		Get: &raft_cmdpb.GetResponse{
+			Value: value,
+		},
+	}}
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header:    &raft_cmdpb.RaftResponseHeader{},
+		Responses: resps,
+	}
+	d.processProposals(cmdResp, entry, false)
+}
+
+func (d *peerMsgHandler) execPut(entry *eraftpb.Entry, req *raft_cmdpb.Request, WB *engine_util.WriteBatch) {
+	WB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+	resps := []*raft_cmdpb.Response{{
+		CmdType: raft_cmdpb.CmdType_Put,
+		Put:     &raft_cmdpb.PutResponse{},
+	}}
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header:    &raft_cmdpb.RaftResponseHeader{},
+		Responses: resps,
+	}
+	d.processProposals(cmdResp, entry, false)
+}
+
+func (d *peerMsgHandler) execDelete(entry *eraftpb.Entry, req *raft_cmdpb.Request, WB *engine_util.WriteBatch) {
+	WB.DeleteCF(req.Delete.Cf, req.Delete.Key)
+	resps := []*raft_cmdpb.Response{{
+		CmdType: raft_cmdpb.CmdType_Delete,
+		Delete:  &raft_cmdpb.DeleteResponse{},
+	}}
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header:    &raft_cmdpb.RaftResponseHeader{},
+		Responses: resps,
+	}
+	d.processProposals(cmdResp, entry, false)
+}
+
+func (d *peerMsgHandler) execSnap(entry *eraftpb.Entry) {
+	resps := []*raft_cmdpb.Response{{
+		CmdType: raft_cmdpb.CmdType_Snap,
+		Snap: &raft_cmdpb.SnapResponse{
+			Region: d.Region(),
+		},
+	}}
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header:    &raft_cmdpb.RaftResponseHeader{},
+		Responses: resps,
+	}
+	d.processProposals(cmdResp, entry, true)
+}
+
+func (d *peerMsgHandler) execCompactLog(entry *eraftpb.Entry, req *raft_cmdpb.AdminRequest, WB *engine_util.WriteBatch) {
+	compactLog := req.GetCompactLog()
+	compactIndex := compactLog.GetCompactIndex()
+	compactTerm := compactLog.GetCompactTerm()
+	// 判断要合并到的索引是否大于当前已经合并的索引（截断点）
+	if compactIndex >= d.peerStorage.applyState.TruncatedState.Index {
+		d.peerStorage.applyState.TruncatedState.Index = compactIndex
+		d.peerStorage.applyState.TruncatedState.Term = compactTerm
+		err := WB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+		if err != nil {
+			log.Panic(err)
+			return
+		}
+		d.ScheduleCompactLog(compactIndex)
+	}
+
+	adminResp := &raft_cmdpb.AdminResponse{
+		CmdType:    raft_cmdpb.AdminCmdType_CompactLog,
+		CompactLog: &raft_cmdpb.CompactLogResponse{},
+	}
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header:        &raft_cmdpb.RaftResponseHeader{},
+		AdminResponse: adminResp,
+	}
+	d.processProposals(cmdResp, entry, false)
+}
+
+func (d *peerMsgHandler) processProposals(resp *raft_cmdpb.RaftCmdResponse, entry *eraftpb.Entry, isExecSnap bool) {
+	if len(d.proposals) > 0 {
+		// 丢弃头部过时的proposal
+		d.dropStaleProposal(entry)
+		if len(d.proposals) == 0 {
+			return
+		}
+		p := d.proposals[0]
+		// 因为index和trem可以唯一确认一条日志，所以判断当前proposal是否是当前日志对应的proposal
+		if p.index > entry.Index {
+			return
+		}
+
+		if p.term != entry.Term {
+			NotifyStaleReq(entry.Term, p.cb)
+			d.proposals = d.proposals[1:]
+			return
+		}
+
+		if isExecSnap {
+			p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false) // 只读事务
+		}
+		// 调用回调函数返回结果
+		p.cb.Done(resp)
+		d.proposals = d.proposals[1:]
+	}
+}
+
+func (d *peerMsgHandler) dropStaleProposal(entry *eraftpb.Entry) {
+	if len(d.proposals) > 0 {
+		first := 0
+		for first < len(d.proposals) {
+			p := d.proposals[first]
+			// 从头删除哪些已经过时的proposal
+			if p.index < entry.Index {
+				p.cb.Done(ErrResp(&util.ErrStaleCommand{}))
+				first++
+			} else {
+				break
+			}
+		}
+		if first == len(d.proposals) {
+			d.proposals = make([]*proposal, 0)
+			return
+		}
+		d.proposals = d.proposals[first:]
+	}
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -53,6 +298,7 @@ func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 			log.Errorf("%s handle raft message error %v", d.Tag, err)
 		}
 	case message.MsgTypeRaftCmd:
+		// 由客户端发送的信息，如读写请求或者管理命令，需要使用回调函数回复信息
 		raftCMD := msg.Data.(*message.MsgRaftCmd)
 		d.proposeRaftCommand(raftCMD.Request, raftCMD.Callback)
 	case message.MsgTypeTick:
@@ -114,6 +360,60 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	if len(msg.Requests) > 0 {
+		for _, req := range msg.Requests {
+			var key []byte
+			switch req.CmdType {
+			case raft_cmdpb.CmdType_Get:
+				key = req.Get.GetKey()
+			case raft_cmdpb.CmdType_Put:
+				key = req.Put.GetKey()
+			case raft_cmdpb.CmdType_Delete:
+				key = req.Delete.GetKey()
+			}
+			// 检查请求的 key 是否在当前 region 范围内
+			err = util.CheckKeyInRegion(key, d.Region())
+			if err != nil && req.CmdType != raft_cmdpb.CmdType_Snap {
+				cb.Done(ErrResp(err))
+				return
+			}
+			singleReq := &raft_cmdpb.RaftCmdRequest{
+				Header:   msg.Header,
+				Requests: []*raft_cmdpb.Request{req},
+			}
+			data, marshalErr := singleReq.Marshal()
+			if marshalErr != nil {
+				log.Panic(marshalErr)
+			}
+			// 记录下一个 proposal 的 index 和 term，用于之后的回调函数处理
+			p := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
+			d.proposals = append(d.proposals, p)
+			err := d.RaftGroup.Propose(data)
+			if err != nil {
+				cb.Done(ErrResp(err))
+				return
+			}
+		}
+	}
+
+	if msg.AdminRequest != nil {
+		req := msg.AdminRequest
+		switch req.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			data, err := msg.Marshal()
+			if err != nil {
+				log.Panic(err)
+			}
+			p := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
+			d.proposals = append(d.proposals, p)
+			d.RaftGroup.Propose(data)
+		case raft_cmdpb.AdminCmdType_ChangePeer:
+		// todo
+		case raft_cmdpb.AdminCmdType_TransferLeader:
+		case raft_cmdpb.AdminCmdType_Split:
+
+		}
+	}
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -223,9 +523,9 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)
@@ -271,7 +571,8 @@ func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 }
 
 func handleStaleMsg(trans Transport, msg *rspb.RaftMessage, curEpoch *metapb.RegionEpoch,
-	needGC bool) {
+	needGC bool,
+) {
 	regionID := msg.RegionId
 	fromPeer := msg.FromPeer
 	toPeer := msg.ToPeer

@@ -179,6 +179,10 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
+
+	// 针对集群分区的优化，记录每一轮心跳收到响应的情况
+	// 在leaderelectionTimeout时重置
+	heartbeatResp map[uint64]bool
 }
 
 // newRaft return a raft peer with the given config
@@ -211,6 +215,7 @@ func newRaft(c *Config) *Raft {
 		Prs:              prs,
 		State:            StateFollower,
 		votes:            make(map[uint64]bool),
+		heartbeatResp:    make(map[uint64]bool),
 		Lead:             None,
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
@@ -232,7 +237,9 @@ func (r *Raft) sendAppend(to uint64) {
 	}
 	prevLogIndex := pr.Next - 1
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
-	if err != nil {
+
+	if err != nil || r.RaftLog.FirstIndex()-1 > prevLogIndex {
+		r.sendSnapshot(to)
 		return
 	}
 
@@ -343,6 +350,31 @@ func (r *Raft) sendRequestVoteResponse(reject bool, to uint64) {
 	log.DPrintfRaft("%x send requestVote response to %x, reject:%v\n", r.id, to, reject)
 }
 
+func (r *Raft) sendSnapshot(to uint64) {
+	var snapshot pb.Snapshot
+	var err error
+	if !IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		snapshot = *r.RaftLog.pendingSnapshot
+	} else {
+		snapshot, err = r.RaftLog.storage.Snapshot()
+	}
+
+	if err != nil {
+		return
+	}
+
+	msg := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		To:       to,
+		Term:     r.Term,
+		From:     r.id,
+		Snapshot: &snapshot,
+	}
+	r.msgs = append(r.msgs, msg)
+	log.DPrintfRaft("%x send snapshot to %x, snapshot index:%d, snapshot term:%d\n", r.id, to, snapshot.Metadata.Index, snapshot.Metadata.Term)
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
+}
+
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
@@ -366,6 +398,18 @@ func (r *Raft) tick() {
 		}
 	case StateLeader:
 		r.heartbeatElapsed++
+		hrtNum := len(r.heartbeatResp)
+		totalNum := len(r.Prs)
+		if r.electionElapsed >= r.electionTimeout {
+			r.electionElapsed = 0
+			// 重置心跳响应记录
+			r.heartbeatResp = make(map[uint64]bool)
+			r.heartbeatResp[r.id] = true
+			if hrtNum*2 <= totalNum {
+				// 少于大半数节点响应心跳，说明可能出现了网络分区，直接发起新一轮选举
+				r.startElection()
+			}
+		}
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
 			err := r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
@@ -662,6 +706,8 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 	// 更新提交日志索引
 	oldCom := r.RaftLog.committed
 	r.updateCommitIndex()
+	// 如果committed更新了，给所有Follower发送AppendEntries，以便它们也能更新提交索引
+	// 保证节点间提交索引等hardState一致，便于后续状态机的选举
 	if r.RaftLog.committed != oldCom {
 		for id := range r.Prs {
 			if id != r.id {
@@ -776,6 +822,7 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 			r.becomeFollower(r.Term, None)
 		}
 	}
+	r.heartbeatResp[m.From] = true
 	log.DPrintfRaft("%x receive heartbeatResponse from %x\n", r.id, m.From)
 	if m.Commit < r.RaftLog.committed {
 		r.sendAppend(m.From)
@@ -788,6 +835,61 @@ func (r *Raft) handleTransferLeader(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	// 前置，判断状态和更新Term与State
+	if r.Term < m.Term {
+		r.Term = m.Term
+		if r.State != StateFollower {
+			r.becomeFollower(r.Term, None)
+		}
+	} else if r.Term > m.Term {
+		return
+	}
+
+	if r.RaftLog.pendingSnapshot != nil {
+		log.Errorf("[raft %d] handleSnapshot called with pending snapshot", r.id)
+		return
+	}
+
+	log.DPrintfRaft("%x receive snapshot from %x\n", r.id, m.From)
+	s := m.Snapshot
+
+	// 判断是否SnapShot的状态更新,如果快照记录到的索引小于当前日志第一个索引或者committed索引，说明快照已经过时了
+	// 或者说无需处理该快照了，直接return不做反应即可
+	if r.RaftLog.FirstIndex() > s.Metadata.Index || s.Metadata.Index < r.RaftLog.committed {
+		return
+	}
+	if r.Lead != m.From {
+		r.Lead = m.From
+	}
+
+	// 只有比快照中最后一个索引值还大的日志需要留下来
+	if len(r.RaftLog.entries) > 0 {
+		if s.Metadata.Index >= r.RaftLog.LastIndex() {
+			r.RaftLog.entries = nil
+		} else {
+			r.RaftLog.entries = r.RaftLog.entries[s.Metadata.Index-r.RaftLog.FirstIndex()+1:]
+		}
+	}
+
+	// 更新状态
+	r.RaftLog.committed = s.Metadata.Index
+	r.RaftLog.applied = s.Metadata.Index
+	r.RaftLog.stabled = s.Metadata.Index
+
+	// 集群节点变更
+	if s.Metadata.ConfState != nil {
+		// snapShot也会存储集群状态这些元数据
+		r.Prs = make(map[uint64]*Progress)
+		for _, node := range s.Metadata.ConfState.Nodes {
+			r.Prs[node] = &Progress{}
+			r.Prs[node].Next = s.Metadata.Index + 1
+			r.Prs[node].Match = 0
+		}
+	}
+
+	r.RaftLog.pendingSnapshot = s
+
+	r.sendAppendResponse(true, m.From, r.RaftLog.LastIndex())
 }
 
 // addNode add a new node to raft group
@@ -820,6 +922,8 @@ func (r *Raft) reset(term uint64) {
 	r.resetRandomizedElectionTimeout()
 	r.leadTransferee = None
 	r.votes = make(map[uint64]bool)
+	r.heartbeatResp = make(map[uint64]bool)
+	r.heartbeatResp[r.id] = true
 }
 
 func (r *Raft) resetRandomizedElectionTimeout() {

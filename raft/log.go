@@ -50,9 +50,6 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
-	// 用于快速判断处于内存中的entries起始元素的索引,这里设置的是实际内存entries的第一个实际entry的索引，便于与目前
-	// 实际的storage中的firstIndex进行区分
-	entsFirstIndex uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -84,7 +81,6 @@ func newLog(storage Storage) *RaftLog {
 		stabled:         lastIndex,
 		entries:         entries,
 		pendingSnapshot: nil,
-		entsFirstIndex:  firstIndex,
 	}
 }
 
@@ -101,12 +97,12 @@ func (l *RaftLog) maybeCompact() {
 	if err != nil {
 		panic(err)
 	}
-	if firstIndex > l.entsFirstIndex {
-		ents := l.entries[firstIndex-l.entsFirstIndex:]
-		// 注意这里要重新make一个slice，否则compact掉的entries仍然会被引用着，无法被GC
-		l.entries = make([]pb.Entry, len(ents))
-		copy(l.entries, ents)
-		l.entsFirstIndex = firstIndex
+	if len(l.entries) > 0 {
+		if firstIndex > l.LastIndex() {
+			l.entries = nil
+		} else if firstIndex >= l.FirstIndex() {
+			l.entries = l.entries[firstIndex-l.FirstIndex():]
+		}
 	}
 	// Your Code Here (2C).
 }
@@ -137,10 +133,10 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 	if len(l.entries) == 0 {
 		return []pb.Entry{}
 	}
-	if l.stabled < l.entsFirstIndex {
+	if l.stabled < l.FirstIndex() {
 		return l.entries
 	}
-	start := l.stabled - l.entsFirstIndex + 1
+	start := l.stabled - l.FirstIndex() + 1
 	if start >= uint64(len(l.entries)) {
 		return []pb.Entry{}
 	}
@@ -151,16 +147,20 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	if len(l.entries) > 0 {
-		if l.applied >= l.entsFirstIndex-1 && l.committed >= l.entsFirstIndex-1 && l.applied < l.committed && l.committed <= l.LastIndex() {
-			return l.entries[l.applied-l.entsFirstIndex+1 : l.committed-l.entsFirstIndex+1]
+		if l.applied >= l.FirstIndex()-1 && l.committed >= l.FirstIndex()-1 && l.applied < l.committed && l.committed <= l.LastIndex() {
+			return l.entries[l.applied-l.FirstIndex()+1 : l.committed-l.FirstIndex()+1]
 		}
 	}
 	return make([]pb.Entry, 0)
 }
+
 func (l *RaftLog) FirstIndex() uint64 {
 	if len(l.entries) > 0 {
-		return l.entsFirstIndex
+		// 如果当前持有的日志不为空，就直接返回一个日志的index
+		return l.entries[0].Index
 	}
+	// 否则当前状态要么是集群刚启动，要么是snapshot刚被安装或者日志被compact掉了
+	// 这几种情况下都需要通过storage接口获取firstIndex
 	index, _ := l.storage.FirstIndex()
 	return index
 }
@@ -171,16 +171,19 @@ func (l *RaftLog) LastIndex() uint64 {
 	if len(l.entries) > 0 {
 		return l.entries[len(l.entries)-1].Index
 	}
-	index, _ := l.storage.LastIndex()
-	return index
+	return l.stabled
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
+	if !IsEmptySnap(l.pendingSnapshot) && i == l.pendingSnapshot.Metadata.Index {
+		return l.pendingSnapshot.Metadata.Term, nil
+	}
+
 	if len(l.entries) > 0 {
-		if i >= l.entsFirstIndex && i <= l.LastIndex() {
-			return l.entries[i-l.entsFirstIndex].Term, nil
+		if i >= l.FirstIndex() && i <= l.LastIndex() {
+			return l.entries[i-l.FirstIndex()].Term, nil
 		}
 	}
 
@@ -188,6 +191,7 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	if err != nil {
 		return term, err
 	}
+
 	return 0, nil
 }
 

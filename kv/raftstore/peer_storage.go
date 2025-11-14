@@ -308,6 +308,38 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+	if len(entries) == 0 {
+		return nil
+	}
+
+	var err error = nil
+	enFirstIndex := entries[0].Index
+	enLastIndex := entries[len(entries)-1].Index
+	psFirstIndex, _ := ps.FirstIndex()
+	psLastIndex, _ := ps.LastIndex()
+
+	if enLastIndex < psFirstIndex {
+		// 新的日志全部被覆盖，直接返回
+		return nil
+	}
+
+	// 只取没有被覆盖的日志
+	if enFirstIndex < psFirstIndex {
+		entries = entries[psFirstIndex-enFirstIndex:]
+	}
+
+	for _, en := range entries {
+		err = raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, en.Index), &en)
+		if err != nil {
+			return err
+		}
+	}
+
+	// 删除索引冲突的日志（那部分可能是没达成共识后被其余leader覆盖的日志）
+	for i := enLastIndex + 1; i <= psLastIndex; i++ {
+		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
+	}
+
 	return nil
 }
 
@@ -323,7 +355,50 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+
+	if ps.isInitialized() {
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			log.Panic(err)
+		}
+		ps.clearExtraData(snapData.Region)
+	}
+
+	// 更新peer的元数据
+	ps.raftState.LastIndex = snapshot.Metadata.Index
+	ps.raftState.LastTerm = snapshot.Metadata.Term
+	ps.applyState.AppliedIndex = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
+	ps.snapState.StateType = snap.SnapState_Applying
+
+	if err := kvWB.SetMeta(meta.ApplyStateKey(snapData.GetRegion().GetId()), ps.applyState); err != nil {
+		log.Panic(err)
+	}
+	meta.WriteRegionState(kvWB, snapData.GetRegion(), rspb.PeerState_Normal)
+
+	if err := raftWB.SetMeta(meta.RaftStateKey(snapData.GetRegion().GetId()), ps.raftState); err != nil {
+		log.Panic(err)
+	}
+
+	// 等待snapShot接收完毕
+	ch := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: snapData.GetRegion().GetId(),
+		Notifier: ch,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.GetStartKey(),
+		EndKey:   snapData.Region.GetEndKey(),
+	}
+	if !(<-ch) {
+		return nil, nil
+	}
+
+	applySnapRet := &ApplySnapResult{
+		PrevRegion: ps.Region(),
+		Region:     snapData.Region,
+	}
+
+	return applySnapRet, nil
 }
 
 // Save memory states to disk.
@@ -331,7 +406,44 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
-	return nil, nil
+	var applySnap *ApplySnapResult = nil
+	rfWB := new(engine_util.WriteBatch)
+	kvWB := new(engine_util.WriteBatch)
+
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		var err error
+		applySnap, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, rfWB)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// 持久化Ready中需要持久化的日志
+	err := ps.Append(ready.Entries, rfWB)
+	if err != nil {
+		return nil, err
+	}
+
+	// 更新RaftLocalState
+	if len(ready.Entries) != 0 {
+		// 其实上层中的lastIndex和LastTerm肯定是对应着RaftLog中的stable部分的最后一条日志的index和term的（因为前面已经持久化过了）
+		newLastIndex := ready.Entries[len(ready.Entries)-1].Index
+		newLastTerm := ready.Entries[len(ready.Entries)-1].Term
+		if newLastIndex > ps.raftState.LastIndex {
+			ps.raftState.LastIndex = newLastIndex
+			ps.raftState.LastTerm = newLastTerm
+		}
+	}
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+	}
+
+	// 写入RaftLocalState到db中
+	err = rfWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	err = rfWB.WriteToDB(ps.Engines.Raft)
+	err = kvWB.WriteToDB(ps.Engines.Kv)
+
+	return applySnap, nil
 }
 
 func (ps *PeerStorage) ClearData() {

@@ -164,6 +164,7 @@ func (rn *RawNode) HasReady() bool {
 	if hardSt := r.hardState(); !IsEmptyHardState(hardSt) && !isHardStateEqual(hardSt, rn.prevHardSt) {
 		return true
 	}
+	// 判断是否有软状态，信息，未持久化的日志，未提交的日志需要处理
 	if softSt := r.softState(); !isSoftStateEqual(softSt, rn.prevSoftSt) ||
 		!IsEmptySnap(r.RaftLog.pendingSnapshot) ||
 		len(r.msgs) > 0 ||

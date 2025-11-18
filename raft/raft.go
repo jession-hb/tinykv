@@ -662,6 +662,8 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 	// 更新提交日志索引
 	oldCom := r.RaftLog.committed
 	r.updateCommitIndex()
+	// 如果committed更新了，给所有Follower发送AppendEntries，以便它们也能更新提交索引
+	// 保证节点间提交索引等hardState一致，便于后续状态机的选举
 	if r.RaftLog.committed != oldCom {
 		for id := range r.Prs {
 			if id != r.id {

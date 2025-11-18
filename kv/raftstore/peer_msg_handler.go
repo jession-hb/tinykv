@@ -6,10 +6,13 @@ import (
 
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
@@ -53,12 +56,39 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 		// trans是抽象出来的raft之间的消息传输层，其只定义一个Send方法
 		// 具体如何传递过去（RPC还是本地队列等方法），由上层调用者实现
-		if rd.Messages != nil {
+		if len(rd.Messages) != 0 {
 			d.Send(d.ctx.trans, rd.Messages)
 		}
 
-		// 更新kvdb中的apply_state与region_state
+		kvWB := new(engine_util.WriteBatch)
+		// 将已提交但未应用的日志进行应用
+		for _, entry := range rd.CommittedEntries {
 
+			// 执行条目
+			if entry.EntryType != eraftpb.EntryType_EntryConfChange {
+				d.execEntry(&entry, kvWB)
+			}
+			// 当前索引要引用到状态机
+			d.peerStorage.applyState.AppliedIndex = entry.Index
+
+			if d.stopped {
+				return
+			}
+		}
+
+		// 写入状态和WB
+		if len(rd.CommittedEntries) > 0 {
+			err = kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			if err != nil {
+				log.Panic(err)
+			}
+			// 写入kv引擎中
+			err = kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+			if err != nil {
+				log.Panic(err)
+			}
+		}
+		d.RaftGroup.Advance(rd)
 	}
 }
 

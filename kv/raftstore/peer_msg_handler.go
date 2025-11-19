@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -49,9 +50,20 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if d.RaftGroup.HasReady() {
 		rd := d.RaftGroup.Ready()
 		// 需要将Ready中的相关元数据和hardstate持久化到存储引擎中
-		_, err := d.peerStorage.SaveReadyState(&rd)
+		applySnapRet, err := d.peerStorage.SaveReadyState(&rd)
 		if err != nil {
 			return
+		}
+
+		if applySnapRet != nil {
+			if !reflect.DeepEqual(applySnapRet.PrevRegion, applySnapRet.Region) {
+				d.peerStorage.SetRegion(applySnapRet.Region)
+				d.ctx.storeMeta.Lock()
+				d.ctx.storeMeta.regions[applySnapRet.Region.Id] = applySnapRet.Region
+				d.ctx.storeMeta.regionRanges.Delete(&regionItem{region: applySnapRet.Region})
+				d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: applySnapRet.Region})
+				d.ctx.storeMeta.Unlock()
+			}
 		}
 
 		// trans是抽象出来的raft之间的消息传输层，其只定义一个Send方法
@@ -89,6 +101,186 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			}
 		}
 		d.RaftGroup.Advance(rd)
+	}
+}
+
+func (p *peerMsgHandler) execEntry(entry *eraftpb.Entry, WB *engine_util.WriteBatch) {
+	// 判断是否是entryType是否是normal
+	if entry.EntryType != eraftpb.EntryType_EntryNormal {
+		return
+	}
+	// 反序列化entry信息
+	msg := &raft_cmdpb.RaftCmdRequest{}
+	err := msg.Unmarshal(entry.Data)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	// 判断是否当前节点的regionepoch更新
+	if msg.Header != nil {
+		fromEpoch := msg.GetHeader().GetRegionEpoch()
+		if fromEpoch != nil && util.IsEpochStale(fromEpoch, p.Region().GetRegionEpoch()) {
+			resp := ErrResp(&util.ErrEpochNotMatch{})
+			p.processProposals(resp, entry, false)
+			return
+		}
+	}
+
+	// admin命令
+	if msg.AdminRequest != nil {
+		req := msg.GetAdminRequest()
+		switch req.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			p.execCompactLog(entry, req, WB)
+		case raft_cmdpb.AdminCmdType_Split:
+		}
+	}
+
+	// common requests
+	if msg.Requests != nil {
+		req := msg.GetRequests()[0]
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			p.execGet(entry, req, WB)
+		case raft_cmdpb.CmdType_Put:
+			p.execPut(entry, req, WB)
+		case raft_cmdpb.CmdType_Delete:
+			p.execDelete(entry, req, WB)
+		case raft_cmdpb.CmdType_Snap:
+			p.execSnap(entry, req, WB)
+		}
+	}
+}
+
+func (d *peerMsgHandler) execGet(entry *eraftpb.Entry, req *raft_cmdpb.Request, WB *engine_util.WriteBatch) {
+	value, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+
+	resps := []*raft_cmdpb.Response{{
+		CmdType: raft_cmdpb.CmdType_Get,
+		Get: &raft_cmdpb.GetResponse{
+			Value: value,
+		},
+	}}
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header:    &raft_cmdpb.RaftResponseHeader{},
+		Responses: resps,
+	}
+	d.processProposals(cmdResp, entry, false)
+}
+
+func (d *peerMsgHandler) execPut(entry *eraftpb.Entry, req *raft_cmdpb.Request, WB *engine_util.WriteBatch) {
+	WB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+	resps := []*raft_cmdpb.Response{{
+		CmdType: raft_cmdpb.CmdType_Put,
+		Put:     &raft_cmdpb.PutResponse{},
+	}}
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header:    &raft_cmdpb.RaftResponseHeader{},
+		Responses: resps,
+	}
+	d.processProposals(cmdResp, entry, false)
+}
+
+func (d *peerMsgHandler) execDelete(entry *eraftpb.Entry, req *raft_cmdpb.Request, WB *engine_util.WriteBatch) {
+	WB.DeleteCF(req.Delete.Cf, req.Delete.Key)
+	resps := []*raft_cmdpb.Response{{
+		CmdType: raft_cmdpb.CmdType_Delete,
+		Delete:  &raft_cmdpb.DeleteResponse{},
+	}}
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header:    &raft_cmdpb.RaftResponseHeader{},
+		Responses: resps,
+	}
+	d.processProposals(cmdResp, entry, false)
+}
+
+func (d *peerMsgHandler) execSnap(entry *eraftpb.Entry, req *raft_cmdpb.Request, WB *engine_util.WriteBatch) {
+	resps := []*raft_cmdpb.Response{{
+		CmdType: raft_cmdpb.CmdType_Snap,
+		Snap: &raft_cmdpb.SnapResponse{
+			Region: d.Region(),
+		},
+	}}
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header:    &raft_cmdpb.RaftResponseHeader{},
+		Responses: resps,
+	}
+	d.processProposals(cmdResp, entry, false)
+}
+
+func (d *peerMsgHandler) execCompactLog(entry *eraftpb.Entry, req *raft_cmdpb.AdminRequest, WB *engine_util.WriteBatch) {
+	compactLog := req.GetCompactLog()
+	compactIndex := compactLog.GetCompactIndex()
+	compactTerm := compactLog.GetCompactTerm()
+	// 判断要合并到的索引是否大于当前已经合并的索引（截断点）
+	if compactIndex >= d.peerStorage.applyState.TruncatedState.Index {
+		d.peerStorage.applyState.TruncatedState.Index = compactIndex
+		d.peerStorage.applyState.TruncatedState.Term = compactTerm
+		err := WB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+		if err != nil {
+			log.Panic(err)
+			return
+		}
+		d.ScheduleCompactLog(compactIndex)
+	}
+
+	adminResp := &raft_cmdpb.AdminResponse{
+		CmdType:    raft_cmdpb.AdminCmdType_CompactLog,
+		CompactLog: &raft_cmdpb.CompactLogResponse{},
+	}
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header:        &raft_cmdpb.RaftResponseHeader{},
+		AdminResponse: adminResp,
+	}
+	d.processProposals(cmdResp, entry, true)
+}
+
+func (d *peerMsgHandler) processProposals(resp *raft_cmdpb.RaftCmdResponse, entry *eraftpb.Entry, isExecSnap bool) {
+	if len(d.proposals) > 0 {
+		// 丢弃头部过时的proposal
+		d.dropStaleProposal(entry)
+		if len(d.proposals) == 0 {
+			return
+		}
+		p := d.proposals[0]
+		// 因为index和trem可以唯一确认一条日志，所以判断当前proposal是否是当前日志对应的proposal
+		if p.index > entry.Index {
+			return
+		}
+
+		if p.term != entry.Term {
+			NotifyStaleReq(entry.Term, p.cb)
+			d.proposals = d.proposals[1:]
+			return
+		}
+
+		if isExecSnap {
+			p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false) // 只读事务
+		}
+		// 调用回调函数返回结果
+		p.cb.Done(resp)
+		d.proposals = d.proposals[1:]
+	}
+}
+
+func (d *peerMsgHandler) dropStaleProposal(entry *eraftpb.Entry) {
+	if len(d.proposals) > 0 {
+		first := 0
+		for first < len(d.proposals) {
+			p := d.proposals[first]
+			// 从头删除哪些已经过时的proposal
+			if p.index < entry.Index {
+				p.cb.Done(ErrResp(&util.ErrStaleCommand{}))
+				first++
+			} else {
+				break
+			}
+		}
+		if first == len(d.proposals) {
+			d.proposals = make([]*proposal, 0)
+			return
+		}
+		d.proposals = d.proposals[first:]
 	}
 }
 

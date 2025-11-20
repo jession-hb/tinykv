@@ -101,13 +101,14 @@ func (l *RaftLog) maybeCompact() {
 	if err != nil {
 		panic(err)
 	}
-	if firstIndex > l.entsFirstIndex {
-		ents := l.entries[firstIndex-l.entsFirstIndex:]
-		// 注意这里要重新make一个slice，否则compact掉的entries仍然会被引用着，无法被GC
-		l.entries = make([]pb.Entry, len(ents))
-		copy(l.entries, ents)
-		l.entsFirstIndex = firstIndex
+	if len(l.entries) > 0 {
+		if firstIndex > l.LastIndex() {
+			l.entries = nil
+		} else if firstIndex >= l.FirstIndex() {
+			l.entries = l.entries[firstIndex-l.FirstIndex():]
+		}
 	}
+	l.entsFirstIndex = firstIndex
 	// Your Code Here (2C).
 }
 
@@ -157,9 +158,10 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	}
 	return make([]pb.Entry, 0)
 }
+
 func (l *RaftLog) FirstIndex() uint64 {
 	if len(l.entries) > 0 {
-		return l.entsFirstIndex
+		return l.entries[0].Index
 	}
 	index, _ := l.storage.FirstIndex()
 	return index

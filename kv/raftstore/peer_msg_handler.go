@@ -47,61 +47,67 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
-	if d.RaftGroup.HasReady() {
-		rd := d.RaftGroup.Ready()
-		// 需要将Ready中的相关元数据和hardstate持久化到存储引擎中
-		applySnapRet, err := d.peerStorage.SaveReadyState(&rd)
-		if err != nil {
-			return
-		}
+	rawNode := d.RaftGroup
+	if !rawNode.HasReady() {
+		return
+	}
+	ready := rawNode.Ready()
 
-		if applySnapRet != nil {
-			if !reflect.DeepEqual(applySnapRet.PrevRegion, applySnapRet.Region) {
-				d.peerStorage.SetRegion(applySnapRet.Region)
-				d.ctx.storeMeta.Lock()
-				d.ctx.storeMeta.regions[applySnapRet.Region.Id] = applySnapRet.Region
-				d.ctx.storeMeta.regionRanges.Delete(&regionItem{region: applySnapRet.Region})
-				d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: applySnapRet.Region})
-				d.ctx.storeMeta.Unlock()
-			}
+	// 持久化
+	applySnapRet, err := d.peerStorage.SaveReadyState(&ready)
+	if err != nil {
+		return
+	}
+	// 快照影响 region
+	if applySnapRet != nil {
+		if !reflect.DeepEqual(applySnapRet.PrevRegion, applySnapRet.Region) {
+			d.peerStorage.SetRegion(applySnapRet.Region)
+			d.ctx.storeMeta.Lock()
+			d.ctx.storeMeta.regions[applySnapRet.Region.Id] = applySnapRet.Region
+			d.ctx.storeMeta.regionRanges.Delete(&regionItem{region: applySnapRet.PrevRegion})
+			d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: applySnapRet.Region})
+			d.ctx.storeMeta.Unlock()
 		}
+	}
 
-		// trans是抽象出来的raft之间的消息传输层，其只定义一个Send方法
-		// 具体如何传递过去（RPC还是本地队列等方法），由上层调用者实现
-		if len(rd.Messages) != 0 {
-			d.Send(d.ctx.trans, rd.Messages)
-		}
+	// 发 msg
+	if len(ready.Messages) != 0 {
+		d.Send(d.ctx.trans, ready.Messages)
+	}
+
+	// apply 应该写入 kvDB 中
+	for _, entry := range ready.CommittedEntries {
+		d.peerStorage.applyState.AppliedIndex = entry.Index
 
 		kvWB := new(engine_util.WriteBatch)
-		// 将已提交但未应用的日志进行应用
-		for _, entry := range rd.CommittedEntries {
-
-			// 执行条目
-			if entry.EntryType != eraftpb.EntryType_EntryConfChange {
-				d.execEntry(&entry, kvWB)
-			}
-			// 当前索引要引用到状态机
-			d.peerStorage.applyState.AppliedIndex = entry.Index
-
-			if d.stopped {
-				return
-			}
+		// 执行条目
+		if entry.EntryType == eraftpb.EntryType_EntryConfChange {
+		} else {
+			d.execEntry(&entry, kvWB)
 		}
-
-		// 写入状态和WB
-		if len(rd.CommittedEntries) > 0 {
-			err = kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
-			if err != nil {
-				log.Panic(err)
-			}
-			// 写入kv引擎中
-			err = kvWB.WriteToDB(d.peerStorage.Engines.Kv)
-			if err != nil {
-				log.Panic(err)
-			}
+		// 停了就直接退出
+		if d.stopped {
+			return
 		}
-		d.RaftGroup.Advance(rd)
+		// 写入状态
+		err = kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+		if err != nil {
+			log.Panic(err)
+		}
+		err = kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+
+		engines := d.peerStorage.Engines
+		txn := engines.Kv.NewTransaction(false)
+		regionId := d.peerStorage.Region().GetId()
+		regionState := new(rspb.RegionLocalState)
+		err = engine_util.GetMetaFromTxn(txn, meta.RegionStateKey(regionId), regionState)
+		if err != nil {
+			log.Panic(err)
+		}
 	}
+
+	// 推进
+	d.RaftGroup.Advance(ready)
 }
 
 func (p *peerMsgHandler) execEntry(entry *eraftpb.Entry, WB *engine_util.WriteBatch) {
@@ -137,22 +143,22 @@ func (p *peerMsgHandler) execEntry(entry *eraftpb.Entry, WB *engine_util.WriteBa
 	}
 
 	// common requests
-	if msg.Requests != nil {
+	if len(msg.Requests) > 0 {
 		req := msg.GetRequests()[0]
 		switch req.CmdType {
 		case raft_cmdpb.CmdType_Get:
-			p.execGet(entry, req, WB)
+			p.execGet(entry, req)
 		case raft_cmdpb.CmdType_Put:
 			p.execPut(entry, req, WB)
 		case raft_cmdpb.CmdType_Delete:
 			p.execDelete(entry, req, WB)
 		case raft_cmdpb.CmdType_Snap:
-			p.execSnap(entry, req, WB)
+			p.execSnap(entry)
 		}
 	}
 }
 
-func (d *peerMsgHandler) execGet(entry *eraftpb.Entry, req *raft_cmdpb.Request, WB *engine_util.WriteBatch) {
+func (d *peerMsgHandler) execGet(entry *eraftpb.Entry, req *raft_cmdpb.Request) {
 	value, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
 
 	resps := []*raft_cmdpb.Response{{
@@ -194,7 +200,7 @@ func (d *peerMsgHandler) execDelete(entry *eraftpb.Entry, req *raft_cmdpb.Reques
 	d.processProposals(cmdResp, entry, false)
 }
 
-func (d *peerMsgHandler) execSnap(entry *eraftpb.Entry, req *raft_cmdpb.Request, WB *engine_util.WriteBatch) {
+func (d *peerMsgHandler) execSnap(entry *eraftpb.Entry) {
 	resps := []*raft_cmdpb.Response{{
 		CmdType: raft_cmdpb.CmdType_Snap,
 		Snap: &raft_cmdpb.SnapResponse{
@@ -205,7 +211,7 @@ func (d *peerMsgHandler) execSnap(entry *eraftpb.Entry, req *raft_cmdpb.Request,
 		Header:    &raft_cmdpb.RaftResponseHeader{},
 		Responses: resps,
 	}
-	d.processProposals(cmdResp, entry, false)
+	d.processProposals(cmdResp, entry, true)
 }
 
 func (d *peerMsgHandler) execCompactLog(entry *eraftpb.Entry, req *raft_cmdpb.AdminRequest, WB *engine_util.WriteBatch) {
@@ -232,7 +238,7 @@ func (d *peerMsgHandler) execCompactLog(entry *eraftpb.Entry, req *raft_cmdpb.Ad
 		Header:        &raft_cmdpb.RaftResponseHeader{},
 		AdminResponse: adminResp,
 	}
-	d.processProposals(cmdResp, entry, true)
+	d.processProposals(cmdResp, entry, false)
 }
 
 func (d *peerMsgHandler) processProposals(resp *raft_cmdpb.RaftCmdResponse, entry *eraftpb.Entry, isExecSnap bool) {
@@ -387,6 +393,25 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				cb.Done(ErrResp(err))
 				return
 			}
+		}
+	}
+
+	if msg.AdminRequest != nil {
+		req := msg.AdminRequest
+		switch req.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			data, err := msg.Marshal()
+			if err != nil {
+				log.Panic(err)
+			}
+			p := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
+			d.proposals = append(d.proposals, p)
+			d.RaftGroup.Propose(data)
+		case raft_cmdpb.AdminCmdType_ChangePeer:
+		// todo
+		case raft_cmdpb.AdminCmdType_TransferLeader:
+		case raft_cmdpb.AdminCmdType_Split:
+
 		}
 	}
 }

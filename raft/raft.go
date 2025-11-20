@@ -232,7 +232,9 @@ func (r *Raft) sendAppend(to uint64) {
 	}
 	prevLogIndex := pr.Next - 1
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
-	if err != nil {
+
+	if err != nil || r.RaftLog.FirstIndex()-1 > prevLogIndex {
+		r.sendSnapshot(to)
 		return
 	}
 
@@ -341,6 +343,31 @@ func (r *Raft) sendRequestVoteResponse(reject bool, to uint64) {
 	}
 	r.msgs = append(r.msgs, msg)
 	log.DPrintfRaft("%x send requestVote response to %x, reject:%v\n", r.id, to, reject)
+}
+
+func (r *Raft) sendSnapshot(to uint64) {
+	var snapshot pb.Snapshot
+	var err error
+	if !IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		snapshot = *r.RaftLog.pendingSnapshot
+	} else {
+		snapshot, err = r.RaftLog.storage.Snapshot()
+	}
+
+	if err != nil {
+		return
+	}
+
+	msg := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		To:       to,
+		Term:     r.Term,
+		From:     r.id,
+		Snapshot: &snapshot,
+	}
+	r.msgs = append(r.msgs, msg)
+	log.DPrintfRaft("%x send snapshot to %x, snapshot index:%d, snapshot term:%d\n", r.id, to, snapshot.Metadata.Index, snapshot.Metadata.Term)
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -790,6 +817,70 @@ func (r *Raft) handleTransferLeader(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	// 前置，判断状态和更新Term与State
+	if r.Term < m.Term {
+		r.Term = m.Term
+		if r.State != StateFollower {
+			r.becomeFollower(r.Term, None)
+		}
+	} else if r.Term > m.Term {
+		return
+	}
+
+	log.DPrintfRaft("%x receive snapshot from %x\n", r.id, m.From)
+	s := m.Snapshot
+
+	// 判断是否SnapShot的状态更新,如果快照记录到的索引小于当前日志第一个索引或者committed索引，说明快照已经过时了
+	// 或者说无需处理该快照了，直接return不做反应即可
+	if r.RaftLog.FirstIndex() > s.Metadata.Index || s.Metadata.Index < r.RaftLog.committed {
+		return
+	}
+	if r.Lead != m.From {
+		r.Lead = m.From
+	}
+
+	// 只有比快照中最后一个索引值还大的日志需要留下来
+	if len(r.RaftLog.entries) > 0 {
+		if s.Metadata.Index >= r.RaftLog.LastIndex() {
+			r.RaftLog.entries = nil
+			// 如果全部丢弃，还需要构建一个空的日志，用与raft处理状态
+			entry := pb.Entry{
+				EntryType: pb.EntryType_EntryNormal,
+				Index:     s.Metadata.Index,
+				Term:      s.Metadata.Term,
+			}
+			r.RaftLog.entries = append(r.RaftLog.entries, entry)
+		} else {
+			r.RaftLog.entries = r.RaftLog.entries[s.Metadata.Index-r.RaftLog.FirstIndex()+1:]
+		}
+	}
+
+	// 更新状态
+	r.RaftLog.applied = s.Metadata.Index
+	r.RaftLog.committed = s.Metadata.Index
+	r.RaftLog.stabled = s.Metadata.Index
+
+	// 集群节点变更
+	if s.Metadata.ConfState != nil {
+		// snapShot也会存储集群状态这些元数据
+		r.Prs = make(map[uint64]*Progress)
+		for _, node := range s.Metadata.ConfState.Nodes {
+			r.Prs[node] = &Progress{}
+			r.Prs[node].Next = r.RaftLog.LastIndex() + 1
+			r.Prs[node].Match = 0
+		}
+	}
+
+	// 因为保证不会日志全删除（至少剩下一个用于判断Index），所以可以直接取第一个日志的Index
+	if r.RaftLog.entries != nil {
+		r.RaftLog.entsFirstIndex = r.RaftLog.entries[0].Index
+	} else {
+		r.RaftLog.entsFirstIndex = s.Metadata.Index
+	}
+
+	r.RaftLog.pendingSnapshot = s
+
+	r.sendAppendResponse(true, m.From, r.RaftLog.LastIndex())
 }
 
 // addNode add a new node to raft group

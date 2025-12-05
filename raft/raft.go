@@ -716,7 +716,7 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 		}
 	}
 
-	// 处理领导权转移
+	// 处理领导权转移，当转移目标的日志不与leader一样新的时候，之前leader会先同步日志，同步完毕后再次尝试转移到目标
 	if m.From == r.leadTransferee {
 		r.Step(pb.Message{MsgType: pb.MessageType_MsgTransferLeader, From: m.From})
 	}
@@ -830,6 +830,35 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 }
 
 func (r *Raft) handleTransferLeader(m pb.Message) {
+	if r.State != StateLeader {
+		log.Panic("only leader can transfer leader")
+	}
+
+	// 如果节点不处于集群中，或者当前转移目标已经是节点，则直接return
+	if _, ok := r.Prs[m.From]; !ok {
+		return
+	}
+
+	// 如果当前转移目标不是leader本身，则不论是否已经存在转移目标，都强制设置转移目标
+	if m.From != r.id {
+		r.leadTransferee = m.From
+	} else {
+		log.DPrintfRaft("%d [term %d] already is leader, stop transfer leadership", r.id, r.Term)
+		return
+	}
+
+	log.DPrintfRaft("%d [term %d] starts to transfer leadership to %d", r.id, r.Term, r.leadTransferee)
+	// 如果转移目标的日志已经和leader一样新了，直接发送TimeoutNow消息
+	if r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgTimeoutNow,
+			To:      m.From,
+			From:    r.id,
+		})
+	} else {
+		// 否则发送AppendEntries消息进行日志同步
+		r.sendAppend(m.From)
+	}
 }
 
 // handleSnapshot handle Snapshot RPC request
@@ -895,11 +924,40 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	_, ok := r.Prs[id]
+	if ok {
+		return
+	} else {
+		r.Prs[id] = &Progress{
+			Match: 0,
+			Next:  r.RaftLog.LastIndex() + 1,
+		}
+	}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	_, ok := r.Prs[id]
+	if !ok {
+		return
+	} else {
+		delete(r.Prs, id)
+	}
+
+	if r.State == StateLeader {
+		if len(r.Prs) != 0 {
+			oldCom := r.RaftLog.committed
+			r.updateCommitIndex()
+			if r.RaftLog.committed != oldCom {
+				for pr := range r.Prs {
+					if pr != r.id {
+						r.sendAppend(pr)
+					}
+				}
+			}
+		}
+	}
 }
 
 func (r *Raft) appendEntry(ents []*pb.Entry) {

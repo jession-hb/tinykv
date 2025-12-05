@@ -21,3 +21,9 @@ jobs:
 
     - name: P2A Test
       run: make project2a
+
+    - name: P2B Test
+      run: make project2b
+
+    - name: P2C Test
+      run: make project2c
